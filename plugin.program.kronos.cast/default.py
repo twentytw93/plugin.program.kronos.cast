@@ -10,12 +10,34 @@ import os
 import cgi
 import base64
 import shutil
+import time
+
 
 ADDON = xbmcaddon.Addon()
 
 server = None
 _server_lock = threading.Lock()
 _current_port = None 
+
+CAST_IN_FLIGHT = False
+CAST_TS = 0.0
+
+def is_busy_or_progress_visible():
+    """
+    True if Kodi Busy/Progress is on-screen.
+    Hard preflight blocker to avoid Kodi 21 SIGABRT on re-entrancy.
+    """
+    checks = (
+        "Window.IsActive(busydialog)",
+        "Window.IsActive(progressdialog)",
+        "Window.IsActive(busydialognocancel)",
+        "Window.IsActive(progressdialogbusy)",
+    )
+    try:
+        return any(xbmc.getCondVisibility(c) for c in checks)
+    except Exception:
+        # Fail-safe: if query fails, assume busy to avoid crash
+        return True
 
 def _read_port():
     try:
@@ -47,8 +69,6 @@ else:
     VIDEO_DIR   = "/storage/videos"
     TORRENT_DIR = "/storage/torrents"
     
-last_uploaded_file = None
-
 for directory in (MUSIC_DIR, VIDEO_DIR, TORRENT_DIR):
     try:
         os.makedirs(directory, exist_ok=True)
@@ -70,25 +90,56 @@ def show_notification(title, message, is_error=False):
     xbmcgui.Dialog().notification(title, message, icon, 3000)
 
 def safe_play(url, media_type="video"):
+    """
+    Returns a tuple: (status, reason)
+      - ("ok", None)              → dispatch attempted
+      - ("blocked", "busy")       → busy/progress preflight hit
+      - ("blocked", "duplicate")  → debounce hit (within 5s)
+      - ("error", "exception")    → unexpected failure
+    """
     try:
-        msg = "Casting your Video..." if media_type == "video" else "Playing your Audio..."
+        # --- Preflight: block if Busy/Progress dialog is visible (prevents Kodi 21 SIGABRT) ---
+        if is_busy_or_progress_visible():
+            xbmc.log("[KronosCast] Cast blocked: busy/progress dialog visible", xbmc.LOGINFO)
+            show_notification("[B]Kronos Cast[/B]", "Cast blocked: Busy/Progress dialog is active.", is_error=True)
+            return ("blocked", "busy")
 
-        custom_icon = os.path.join(ADDON.getAddonInfo('path'), "resources", "media", "cast_icon.png")
-        xbmcgui.Dialog().notification("[B]Kronos Cast[/B]", msg, custom_icon, 3000)
+        # --- Debounce: drop duplicate casts within 5 seconds ---
+        global CAST_IN_FLIGHT, CAST_TS
+        now = time.time()
+        if CAST_IN_FLIGHT and (now - CAST_TS) < 5.0:
+            xbmc.log(f"[KronosCast] Cast ignored: duplicate within {now - CAST_TS:.2f}s", xbmc.LOGINFO)
+            show_notification("[B]Kronos Cast[/B]", "Cast ignored: duplicate within 5s.", is_error=False)
+            return ("blocked", "duplicate")
 
-        if url.startswith("plugin://plugin.video.youtube"):
-            if not xbmc.getCondVisibility("System.HasAddon(plugin.video.youtube)"):
-                show_notification("[B]Kronos Cast[/B]", "YouTube Add-on Not Installed", is_error=True)
-                return
-            xbmc.executebuiltin(f"RunPlugin({url})")
-        else:
-            if url.startswith("/storage") and not os.path.exists(url):
-                show_notification("[B]Kronos Cast[/B]", "File Not Found", is_error=True)
-                return
-            xbmc.Player().play(url)
+        CAST_IN_FLIGHT = True
+        CAST_TS = now
+        try:
+            msg = "Casting your Video..." if media_type == "video" else "Playing your Audio..."
+            custom_icon = os.path.join(ADDON.getAddonInfo('path'), "resources", "media", "cast_icon.png")
+            xbmcgui.Dialog().notification("[B]Kronos Cast[/B]", msg, custom_icon, 3000)
+
+            if url.startswith("plugin://plugin.video.youtube"):
+                if not xbmc.getCondVisibility("System.HasAddon(plugin.video.youtube)"):
+                    show_notification("[B]Kronos Cast[/B]", "YouTube Add-on Not Installed", is_error=True)
+                    return ("error", "youtube_missing")
+                # Stable path (RunPlugin) – JSON-RPC removed due to failures
+                xbmc.executebuiltin(f'RunPlugin("{url}")')
+                return ("ok", None)
+            else:
+                if url.startswith("/storage") and not os.path.exists(url):
+                    show_notification("[B]Kronos Cast[/B]", "File Not Found", is_error=True)
+                    return ("error", "file_not_found")
+                xbmc.Player().play(url)
+                return ("ok", None)
+        finally:
+            # Always clear in-flight so the next cast can proceed
+            CAST_IN_FLIGHT = False
+
     except Exception as e:
         xbmc.log(f"[KronosCast] Playback failed: {str(e)}", xbmc.LOGERROR)
         show_notification("[B]Kronos Cast[/B]", "Playback Failed", is_error=True)
+        return ("error", "exception")
 
 def play_with_elementum(uri, is_torrent=False, allow_blocked=True):
     try:
@@ -108,7 +159,7 @@ def play_with_elementum(uri, is_torrent=False, allow_blocked=True):
             return
 
         elementum_url = f"plugin://plugin.video.elementum/play?uri={urllib.parse.quote(uri)}"
-        xbmc.executebuiltin(f"PlayMedia({elementum_url})")
+        xbmc.executebuiltin(f'PlayMedia("{elementum_url}")')
         show_notification("[B]Kronos Cast[/B]", "Sending to Elementum...")
     except Exception as e:
         xbmc.log(f"[KronosCast] Elementum error: {str(e)}", xbmc.LOGERROR)
@@ -144,6 +195,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             if path.startswith("/cast"):
                 url = query.get("url", [""])[0]
 
+                # Stricter Busy/Progress guard
+                if is_busy_or_progress_visible():
+                    xbmc.log("[KronosCast] /cast blocked: busy/progress dialog visible", xbmc.LOGINFO)
+                    show_notification("[B]Kronos Cast[/B]",
+                                      "Cast blocked: Busy/Progress dialog is active.",
+                                      is_error=True)
+                    self._json({"status": "blocked", "reason": "busy"}, 423)
+                    return
+
                 # Block if a system dialog is up
                 if is_system_dialog_active():
                     show_notification("[B]Kronos Cast[/B]",
@@ -176,8 +236,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                             vid = url.split("v=")[1].split("&")[0]
                         url = f"plugin://plugin.video.youtube/play/?video_id={vid}"
 
-                    safe_play(url, media_type)
-                    self._json({"status": "ok"})
+                    status, reason = safe_play(url, media_type)
+
+                    if status == "ok":
+                        self._json({"status": "ok"})
+                    elif status == "blocked":
+                        self._json({"status": "blocked", "reason": reason}, 423)
+                    else:
+                        self._json({"status": "error", "reason": reason or "unknown"}, 500)
                     return
 
             elif path == "/play":
@@ -282,7 +348,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self):
-        global last_uploaded_file
         try:
             if self.path == "/upload":
                 ctype, pdict = cgi.parse_header(self.headers.get('Content-Type', ''))
@@ -340,7 +405,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                         with open(target_path, 'wb') as f:
                             f.write(file_data)
 
-                        last_uploaded_file = target_path
                         show_notification("[B]Kronos Cast[/B]", f"Uploaded: {filename}")
 
                         if ext == '.torrent':
