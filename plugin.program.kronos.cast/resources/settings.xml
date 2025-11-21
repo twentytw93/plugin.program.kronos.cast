@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<settings>
+    <category label="General">
+        <setting id="port"
+                 type="number"
+                 label="Server Port"
+                 default="9798"
+                 min="1024"
+                 max="65535"
+                 step="1" />
+    </category>
+</settings>
