@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<addon id="plugin.program.kronos.cast" name="Kronos Cast" version="3.0.3" provider-name="Kronos Team">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0"/>
+    </requires>
+    <extension point="xbmc.python.pluginsource" library="gui.py">
+        <provides>executable</provides>
+    </extension>
+    <extension point="xbmc.addon.metadata">
+        <summary>LAN Casting Tool for Kodi</summary>
+        <description>Kronos Cast allows you to cast MP4/MP3, YouTube links, from any Web Browser to Kronos over LAN. Includes VIP Upload, delete files.</description>
+        <platform>all</platform>
+        <assets>
+            <icon>resources/media/k_logo.png</icon>
+        </assets>
+    </extension>
+</addon>
